@@ -74,10 +74,13 @@ def _get_model():
     return _model
 
 
-def rerank(query: str, candidates: list[Result], top_k: int | None = None) -> list[Result]:
+def rerank(query: str, candidates: list[Result], top_k: int | None = None,
+           snippet_cap: int = 512) -> list[Result]:
     """Re-rank candidates by query-document relevance. Falls back to input
     order (RRF) if the model is unavailable or disabled. `top_k` optionally
-    truncates (else returns the full re-ranked list, so MMR can diversify)."""
+    truncates (else returns the full re-ranked list, so MMR can diversify).
+    `snippet_cap` bounds each pair's document text — the adaptive quality
+    ladder scales rerank cost with it (cost is linear in pairs x chars)."""
     if not candidates or not SEMANTIC_RERANK:
         out = list(candidates)
         return out[:top_k] if top_k else out
@@ -88,7 +91,7 @@ def rerank(query: str, candidates: list[Result], top_k: int | None = None) -> li
         return out[:top_k] if top_k else out
 
     try:
-        pairs = [(query, (r.snippet or r.title)[:512]) for r in candidates]
+        pairs = [(query, (r.snippet or r.title)[:snippet_cap]) for r in candidates]
         scores = model.predict(pairs)
         for r, s in zip(candidates, scores, strict=False):
             r.score = float(s)
@@ -101,10 +104,14 @@ def rerank(query: str, candidates: list[Result], top_k: int | None = None) -> li
 
 
 async def rerank_async(query: str, candidates: list[Result],
-                       top_k: int | None = None) -> list[Result]:
+                       top_k: int | None = None, snippet_cap: int = 512,
+                       cost: float | None = None) -> list[Result]:
     """Event-loop-safe `rerank`: lazy model load + predict run on the
-    shared inference worker (see inference.py)."""
-    return await run_inference(rerank, query, candidates, top_k)
+    dedicated rerank executor (see inference.py). `cost` feeds the adaptive
+    quality controller's load estimate."""
+    return await run_inference(rerank, query, candidates, top_k,
+                               kind="rerank", cost=cost,
+                               snippet_cap=snippet_cap)
 
 
 def status() -> dict:

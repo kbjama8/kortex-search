@@ -258,7 +258,14 @@ diversified (abridged to one result so the envelope is legible):
   "reranked": true,
   "partial": true,
   "pending": ["youtube"],
-  "elapsed_ms": 18412
+  "elapsed_ms": 18412,
+  "quality": {
+    "tier": 0,
+    "label": "full",
+    "rerank_candidates": 30,
+    "snippet_cap": 512
+  },
+  "degraded": []
 }
 ```
 

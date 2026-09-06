@@ -44,8 +44,12 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
             async def _load() -> None:
                 try:
-                    await run_inference(rerank._get_model)
+                    await run_inference(rerank._get_model, kind="rerank")
                     await embeddings.encode_async(["warmup"])
+                    # v0.9: preload the CJK embed too — a mid-burst
+                    # CJK-dominant run must never stall the queue on a
+                    # cold bge-m3 load.
+                    await run_inference(embeddings._get_cjk_model, kind="embed")
                 except Exception as exc:  # noqa: BLE001
                     logging.getLogger("kortex_search.cli").warning(
                         "serve warm-up failed: %s", exc)

@@ -17,8 +17,11 @@ import re
 import time
 from typing import Any
 
-from . import cache, llm, ratelimit, stats
+import numpy as np
+
+from . import cache, llm, quality, ratelimit, stats
 from .config import (
+    ADAPTIVE_QUALITY,
     ADAPTIVE_TIMEOUT,
     ADAPTIVE_TIMEOUT_FACTOR,
     ADAPTIVE_TIMEOUT_MAX,
@@ -39,14 +42,16 @@ from .config import (
     RATE_LIMIT_INTERVAL,
     RATE_LIMITED_SOURCES,
     RERANK_CANDIDATES,
+    RERANK_MAX_SNIPPET,
     SEARCH_TOTAL_TIMEOUT,
     SEMANTIC_RERANK,
 )
-from .dedup import dedup
+from .dedup import canonical_url, dedup
 from .diversity import mmr_select
 from .embeddings import cjk_dominant, encode_async
 from .extract.router import tiers_for
 from .fusion import rrf_fuse
+from .inference import load_estimate
 from .models import Result
 from .rerank import rerank_async
 from .sources import get_sources
@@ -353,16 +358,22 @@ async def _run_one(source, query: str, limit: int, category: str,
 async def search(query: str, sources: list[str] | None, category: str = "general",
                  limit: int = DEFAULT_LIMIT, freshness: str | None = None,
                  expand: bool = QUERY_EXPANSION, year_from: int | None = None,
-                 open_access_only: bool = False) -> dict[str, Any]:
+                 open_access_only: bool = False, *,
+                 deadline: float | None = None) -> dict[str, Any]:
     start = time.monotonic()
     # Every leg runs under one end-to-end deadline so a search fits inside
     # the MCP client's request budget (sweep 2026-09-03: the historical
     # worst case ran 150s+ → client timeouts and, under concurrency,
-    # process death from the frozen event loop).
-    deadline = start + SEARCH_TOTAL_TIMEOUT
+    # process death from the frozen event loop). v0.9 extends the deadline
+    # to the POST-fanout stages: inference legs are bounded too, degrading
+    # instead of queueing (see quality.py). A caller-supplied absolute
+    # `deadline` (monotonic seconds) overrides the default budget —
+    # research_answer uses it to fit search + synthesis into one tool call.
+    end_deadline = deadline if deadline is not None else start + SEARCH_TOTAL_TIMEOUT
+    end_deadline = max(end_deadline, start + 1.0)
 
     def _remaining(floor: float = 1.0) -> float:
-        return max(floor, deadline - time.monotonic())
+        return max(floor, end_deadline - time.monotonic())
 
     source_names = list(sources or DEFAULT_SOURCES)  # defensive copy of the default
     fkey = _filter_key(freshness, year_from, open_access_only)
@@ -373,7 +384,10 @@ async def search(query: str, sources: list[str] | None, category: str = "general
                 "sources": {}, "cached": True,
                 "elapsed_ms": int((time.monotonic() - start) * 1000),
                 "extract": _extract_tiers(source_names),
-                "blocked": [], "auth": {}}
+                "blocked": [], "auth": {},
+                "quality": {"tier": 0, "label": "cached",
+                            "rerank_candidates": 0, "snippet_cap": 0},
+                "degraded": []}
 
     objs = get_sources(source_names)
     statuses: dict[str, Any] = {}
@@ -419,12 +433,12 @@ async def search(query: str, sources: list[str] | None, category: str = "general
     # stop once the end-to-end deadline is near: variants are worth ~10s of
     # extra latency, not the full fan-out budget.
     base_total = sum(len(rl) for rl in ranked_lists)
-    expansion_deadline = deadline - 15.0
+    expansion_deadline = end_deadline - 15.0
     if (expand and sources is None and _expansion_needed(base_total)
             and time.monotonic() < expansion_deadline):
         variants = await _expand_query(
             query, budget=min(EXPANSION_LLM_TIMEOUT,
-                              max(1.0, deadline - time.monotonic())))
+                              max(1.0, end_deadline - time.monotonic())))
         if variants:
             tasks2 = {asyncio.ensure_future(
                 _singleflight(s, v, limit, category, freshness, year_from,
@@ -446,32 +460,76 @@ async def search(query: str, sources: list[str] | None, category: str = "general
     # snippet may be None on malformed source output — never let fusion crash
     dedup_docs = [(r.title + " " + (r.snippet or "")[:200]) for r in fused]
     multilingual = cjk_dominant(dedup_docs)
+    degraded: list[str] = []
+
     emb_for_dedup = None
     if EMBEDDING_DEDUP and len(fused) > 1:
-        # encode runs off-loop on the shared model worker — a cold model
-        # load or a long batch must never freeze the MCP event loop
-        # (sweep 2026-09-03: frozen loop + queued requests → stdio session
-        # unwind → clean rc=0 process death under concurrent traffic).
-        emb_for_dedup = await encode_async(dedup_docs,
-                                           multilingual=multilingual)
+        try:
+            # encode runs off-loop on the embed executor; bounded by the
+            # per-search deadline (v0.9) — on expiry dedup degrades to
+            # URL/title layers instead of holding the pipeline hostage.
+            emb_for_dedup = await asyncio.wait_for(
+                encode_async(dedup_docs, multilingual=multilingual),
+                timeout=_remaining())
+        except TimeoutError:
+            degraded.append("dedup_embed")
+    # keep doc vectors keyed by dedup identity so MMR can REUSE them instead
+    # of running a second encode pass (v0.9: halves per-search embed work)
+    vec_by_ckey: dict[str, np.ndarray] = {}
+    if emb_for_dedup is not None and len(emb_for_dedup) == len(fused):
+        for r, v in zip(fused, emb_for_dedup, strict=False):
+            ckey = canonical_url(r.identity())
+            if ckey:
+                vec_by_ckey[ckey] = v
     fused = dedup(fused, embeddings=emb_for_dedup)
     t_dedup = time.monotonic()
 
-    # semantic re-rank the top candidates (full re-ranked list, no truncation)
+    # semantic re-rank the top candidates (adaptive quality ladder, v0.9):
+    # full tier when idle, cheaper tiers as the inference queue backs up,
+    # RRF order when saturated. Every path is bounded by the deadline.
     reranked = None
+    tier = quality.SKIP_TIER
     if SEMANTIC_RERANK and len(fused) > limit:
-        reranked = await rerank_async(query, fused[:RERANK_CANDIDATES])
-    else:
+        load = load_estimate()
+        if ADAPTIVE_QUALITY:
+            tier = quality.pick_tier(
+                remaining=_remaining(), fused=len(fused), limit=limit,
+                candidates_ceiling=RERANK_CANDIDATES,
+                snippet_ceiling=RERANK_MAX_SNIPPET,
+                pending_seconds=load.get("pending_seconds", 0.0))
+        else:
+            tier = quality.Tier(0, min(RERANK_CANDIDATES, len(fused)),
+                                RERANK_MAX_SNIPPET, "full")
+        if tier.candidates:
+            cands = fused[:tier.candidates]
+            est = quality.estimate_rerank(len(cands), tier.snippet_cap)
+            t_rr = time.monotonic()
+            try:
+                reranked = await asyncio.wait_for(
+                    rerank_async(query, cands, snippet_cap=tier.snippet_cap,
+                                 cost=est),
+                    timeout=_remaining())
+                quality.observe_rerank(len(cands), tier.snippet_cap,
+                                       time.monotonic() - t_rr)
+            except TimeoutError:
+                degraded.append("rerank")
+        else:
+            degraded.append("rerank")
+    if reranked is None:
         reranked = fused
     t_rerank = time.monotonic()
 
-    # MMR diversity on the re-ranked candidates (per-category λ)
+    # MMR diversity on the re-ranked candidates (per-category λ). Embeddings
+    # are reused from the dedup pass (v0.9) — no encode, nothing to bound.
     if MMR_ENABLED and len(reranked) > limit:
-        emb_for_mmr = await encode_async(
-            [(r.title + " " + r.snippet[:200]) for r in reranked],
-            multilingual=multilingual)
+        emb_for_mmr = None
+        if vec_by_ckey:
+            vecs = [vec_by_ckey.get(canonical_url(r.identity()))
+                    for r in reranked]
+            if all(v is not None for v in vecs):
+                emb_for_mmr = np.stack(vecs)
         final = mmr_select(reranked, emb_for_mmr, limit,
-                          lam=_category_lambda(category))
+                           lam=_category_lambda(category))
     else:
         final = reranked[:limit]
     t_mmr = time.monotonic()
@@ -480,6 +538,17 @@ async def search(query: str, sources: list[str] | None, category: str = "general
     cache.set(query, source_names, category, limit, result_dicts, filters=fkey)
 
     blocked, auth = _extract_signals(statuses)
+
+    if not SEMANTIC_RERANK:
+        quality_block = {"tier": 0, "label": "disabled",
+                         "rerank_candidates": 0, "snippet_cap": 0}
+    elif tier is quality.SKIP_TIER and len(fused) <= limit:
+        quality_block = {"tier": 0, "label": "not-needed",
+                         "rerank_candidates": 0, "snippet_cap": 0}
+    else:
+        quality_block = {"tier": tier.level, "label": tier.label,
+                         "rerank_candidates": tier.candidates,
+                         "snippet_cap": tier.snippet_cap}
 
     return {
         "query": query,
@@ -498,6 +567,8 @@ async def search(query: str, sources: list[str] | None, category: str = "general
             "mmr": int((t_mmr - t_rerank) * 1000),
             "total": int((time.monotonic() - start) * 1000),
         },
+        "quality": quality_block,
+        "degraded": degraded,
         # v0.4 extraction-layer signals (additive, optional for clients)
         "extract": _extract_tiers(source_names),
         "blocked": blocked,

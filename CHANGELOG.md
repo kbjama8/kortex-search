@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-06
+
+"Adaptive quality ladder" — parallel-agent bursts no longer time out.
+
+### Root cause fixed
+
+Four agents x 3-4 concurrent MCP calls (12-16 in-flight searches) queued on
+the single inference worker thread: every search burns ~5s of serialized
+CPU inference (rerank 4.7s @ 30 pairs x 512 chars + 2 embeds), the
+post-fanout stages had NO deadline (only the fan-out was bounded), so the
+queue ran 60-80s deep against the client's 30s request budget — every call
+timed out, and aborted calls still burned their queued worker time
+(queue thrash). Measured live: a 4-way burst degraded walls 7.1s →
+16.0/16.1/16.3s. Parallel rerank threads were ruled out by measurement —
+concurrent ONNX predicts contend on the CPU pool (4-parallel = 16.1s wall
+for 4 x 4.5s jobs), so the fix is work REDUCTION, not more workers.
+
+### Added
+- **`quality.py` — adaptive quality controller.** The rerank stage scales
+  down a 5-rung ladder with the inference queue's pending work and the
+  per-search remaining budget: full (30 x 512 chars) idle → light (20 x
+  384) → moderate (15 x 256) → busy (10 x 160) → saturated (skip rerank,
+  RRF order). Hysteresis: downgrade fast on a load spike, upgrade only
+  after the load window clears. The linear cost model (k x pairs x chars +
+  overhead) self-calibrates from observed predict durations.
+- **Deadline enforcement on ALL stages (v0.9):** dedup-embed, rerank, and
+  the fan-out now run under the per-search end-to-end deadline; on expiry
+  the stage degrades (URL/title dedup, RRF order) instead of queueing.
+  `orchestrator.search` accepts an explicit caller `deadline`.
+- **Envelope additions (additive):** `quality` block (tier/label/
+  candidates/snippet cap) and `degraded` list — degradation is reported,
+  never silent.
+- **Two inference executors** (embed / rerank): cheap embed jobs no longer
+  wait behind multi-second reranks. Load accounting (`inference.load_estimate`,
+  surfaced in `stats_report`) feeds the controller.
+- **MMR embeds reuse the dedup pass** — the second encode per search is gone.
+- **`research_answer` whole-tool budget** (`KORTEX_SEARCH_ANSWER_TOTAL_TIMEOUT`,
+  default 50s): search + synthesis fit one client request; the synthesis
+  budget shrinks to whatever the search leg leaves.
+- **`--warm` preloads the CJK embed model** — a mid-burst CJK-dominant run
+  can no longer stall the queue on a cold load.
+
+### Fixed
+- The 2026-09-03 deadline knob only bounded the fan-out; a loaded pipeline
+  sailed past `KORTEX_SEARCH_TOTAL_TIMEOUT` in the CPU stages (now bounded).
+
+### Changed
+- `KORTEX_SEARCH_RERANK_CANDIDATES` (30) is now the CEILING of the adaptive
+  ladder; `KORTEX_SEARCH_RERANK_MAX_SNIPPET` (512) bounds pair length.
+- Client-side (opencode): the MCP request timeout for kortex-search is
+  raised 30s → 60s to align with the server budgets.
+
+### Tests
+- `tests/test_adaptive_quality.py` (17 tests): tier picking + hysteresis,
+  cost-model calibration, executor split, load reporting, per-stage
+  deadline degradation, saturated-queue skip, a 16-search burst all within
+  deadline, caller deadline, `research_answer` total budget.
+- `tests/test_loop_liveness.py::test_rerank_runs_off_event_loop` now
+  actually exercises the rerank branch (the old FakeSource truncation made
+  it vacuous).
+
 ## [0.8.3] - 2026-09-04
 
 ### Added

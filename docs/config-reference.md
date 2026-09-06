@@ -83,10 +83,23 @@ some academic APIs ask for, not an API key.*
 | `KORTEX_SEARCH_TOTAL_TIMEOUT` | `45` | end-to-end budget per search tool call (fan-out + expansion + CPU legs must fit the client's request budget) |
 | `KORTEX_SEARCH_EXPANSION_LLM_TIMEOUT` | `12` | expansion LLM leg budget; slow completion degrades to "no variants" |
 | `KORTEX_SEARCH_ANSWER_LLM_TIMEOUT` | `25` | `research_answer` synthesis leg budget; slow completion degrades to an explicit timeout answer |
+| `KORTEX_SEARCH_ANSWER_TOTAL_TIMEOUT` | `50` | whole-tool budget for `research_answer` (search + synthesis legs together) — must fit the MCP client's request timeout |
 | `KORTEX_SEARCH_SOURCE_TIMEOUT` | `18` | per-source timeout (seconds) |
 
 `KORTEX_SEARCH_TIMEOUT=50` bounds the whole fan-out in seconds (`config.py`).
 Lower it when sources hang; raise it for slow verticals.
+
+## Adaptive quality (v0.9)
+
+*The rerank stage scales its work with load: full quality when idle, graceful
+degradation when the inference queue is busy. The controller picks the highest
+rung of the ladder whose estimated completion fits the per-search remaining
+budget; the hard deadline is the backstop.*
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `KORTEX_SEARCH_ADAPTIVE_QUALITY` | `true` | enable the load-adaptive rerank tier ladder (disable = always full tier) |
+| `KORTEX_SEARCH_RERANK_MAX_SNIPPET` | `512` | ceiling on per-pair snippet length (lower tiers use shorter snippets) |
 
 ## Retry
 
@@ -128,7 +141,7 @@ diverse list.*
 | `KORTEX_SEARCH_EMBED_CJK` | `1` | enable/disable the CJK-dominant detection + multilingual model switch |
 | `KORTEX_SEARCH_CJK_SHARE_THRESHOLD` | `0.25` | CJK char share that triggers the multilingual model |
 | `SEMANTIC_RERANK` | `1` | `0` = RRF-only |
-| `KORTEX_SEARCH_RERANK_CANDIDATES` | `30` | top-RRF candidates re-ranked |
+| `KORTEX_SEARCH_RERANK_CANDIDATES` | `30` | CEILING on reranked candidates (the adaptive ladder picks lower rungs under load) |
 | `KORTEX_SEARCH_MMR` | `1` | diversity filter |
 | `KORTEX_SEARCH_MMR_LAMBDA` | `0.75` | relevance vs diversity trade-off |
 | `KORTEX_SEARCH_EMBEDDING_DEDUP` | `1` | embedding near-dup collapse |

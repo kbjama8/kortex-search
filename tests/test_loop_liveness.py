@@ -94,9 +94,13 @@ def test_rerank_runs_off_event_loop(monkeypatch, rds):
     # many results so the rerank branch (len(fused) > limit) triggers
     monkeypatch.setattr(orch, "SEMANTIC_RERANK", True)
     monkeypatch.setattr(orch, "EMBEDDING_DEDUP", False)
-    monkeypatch.setattr(rr, "rerank", lambda query, cands, top_k=None: cands)
+    monkeypatch.setattr(rr, "rerank",
+                        lambda query, cands, top_k=None, snippet_cap=512: cands)
 
-    s1 = FakeSource("s1", [_mk(f"T{i}", f"https://a.com/{i}") for i in range(20)])
+    from tests.test_adaptive_quality import FatSource
+    from tests.test_pipeline import _mk
+
+    s1 = FatSource("s1", [_mk(f"T{i}", f"https://a.com/{i}") for i in range(20)])
     monkeypatch.setattr(orch, "get_sources", lambda names: [s1])
 
     async def run():

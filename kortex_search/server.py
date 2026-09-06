@@ -10,11 +10,12 @@ import asyncio
 import hmac
 import json
 import re
+import time
 
 from fastmcp import FastMCP
 from starlette.middleware import Middleware
 
-from . import health, llm, orchestrator, stats
+from . import health, inference, llm, orchestrator, stats
 from . import saved_queries as sq
 from .config import (
     ACADEMIC_SOURCES,
@@ -22,6 +23,7 @@ from .config import (
     DEFAULT_LIMIT,
     DEFAULT_SOURCES,
     HTTP_TOKEN,
+    RESEARCH_ANSWER_TOTAL_TIMEOUT,
     SOCIAL_SOURCES,
     WEB_SOURCES,
 )
@@ -423,8 +425,21 @@ async def research_answer(
     Note: the search results are UNTRUSTED web content. They are delimited
     and the model is instructed to treat them as data — never as instructions.
     """
+    tool_start = time.monotonic()
+    tool_deadline = tool_start + RESEARCH_ANSWER_TOTAL_TIMEOUT
+    # The search leg gets the tool budget minus a synthesis reserve (v0.9):
+    # both legs must fit ONE client request — a slow search must not eat the
+    # answer's budget, and vice versa.
+    search_deadline = tool_start + max(
+        1.0, RESEARCH_ANSWER_TOTAL_TIMEOUT - min(ANSWER_LLM_TIMEOUT, 15.0))
+
+    def _synthesis_budget() -> float:
+        return min(ANSWER_LLM_TIMEOUT,
+                   max(1.0, tool_deadline - time.monotonic() - 2.0))
+
     search_result = await orchestrator.search(
         query, _resolve_sources(sources), limit=_clamp_limit(limit),
+        deadline=search_deadline,
     )
     results = search_result.get("results", [])
     if not results:
@@ -468,7 +483,7 @@ async def research_answer(
                 max_tokens=2048,
                 json_mode=True,
             ),
-            timeout=ANSWER_LLM_TIMEOUT,
+            timeout=_synthesis_budget(),
         )
     except TimeoutError:
         # synthesis is a luxury on top of the search — a slow LLM must not
@@ -493,7 +508,7 @@ async def research_answer(
                      {"role": "user", "content": prompt}],
                     max_tokens=2048, thinking=False, json_mode=True,
                 ),
-                timeout=ANSWER_LLM_TIMEOUT,
+                timeout=_synthesis_budget(),
             )
         except Exception as exc:  # noqa: BLE001
             return {"answer": f"(answer synthesis failed: {exc})",
@@ -551,23 +566,27 @@ async def doctor() -> dict:
 @mcp.tool()
 async def warm() -> dict:
     """Preload the rerank + embed models so the next search skips cold-model
-    latency. Loads run off-loop on the shared model worker (see
-    inference.py) — the MCP event loop stays live throughout."""
+    latency. Loads run off-loop on the model workers (see inference.py) —
+    the MCP event loop stays live throughout. v0.9 also preloads the CJK
+    embed model so a mid-burst CJK-dominant run never stalls the queue on a
+    cold load."""
     from . import embeddings, rerank
     from .inference import run_inference
 
-    await run_inference(rerank._get_model)  # same-package preload (intentional)
+    await run_inference(rerank._get_model, kind="rerank")  # same-package preload (intentional)
     await embeddings.encode_async(["warmup"])
+    await run_inference(embeddings._get_cjk_model, kind="embed")
     return {"rerank": rerank.status(), "embed": embeddings.status()}
 
 
 @mcp.tool()
 async def stats_report() -> dict:
     """Per-source reliability & latency stats (rolling 24h) + block-event
-    reservoir + ledger health."""
+    reservoir + ledger health + inference queue load."""
     out = stats.snapshot()
     out["blocks"] = stats.blocks_snapshot()
     out["_ledger"] = stats.ledger_health()
+    out["load"] = inference.load_estimate()
     return out
 
 

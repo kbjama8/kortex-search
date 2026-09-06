@@ -76,6 +76,18 @@ EXPANSION_LLM_TIMEOUT = _env_float("KORTEX_SEARCH_EXPANSION_LLM_TIMEOUT", 12.0)
 # research_answer's synthesis leg (on top of the search itself).
 ANSWER_LLM_TIMEOUT = _env_float("KORTEX_SEARCH_ANSWER_LLM_TIMEOUT", 25.0)
 
+# --- adaptive quality (v0.9) ---
+# The rerank stage scales its work with load (see quality.py): full quality
+# idle, graceful degradation when the inference queue is busy. These are the
+# CEILINGS the ladder can never exceed; the existing RERANK_CANDIDATES knob
+# doubles as the candidate ceiling.
+ADAPTIVE_QUALITY = _env_bool("KORTEX_SEARCH_ADAPTIVE_QUALITY", True)
+RERANK_MAX_SNIPPET = _env_int("KORTEX_SEARCH_RERANK_MAX_SNIPPET", 512)
+# research_answer's whole-tool budget (search + synthesis legs together) —
+# must fit inside the MCP client's request timeout.
+RESEARCH_ANSWER_TOTAL_TIMEOUT = _env_int(
+    "KORTEX_SEARCH_ANSWER_TOTAL_TIMEOUT", 50)
+
 # --- retry (Phase 3) ---
 RETRY_COUNT = _env_int("KORTEX_SEARCH_RETRY_COUNT", 1)
 RETRY_BACKOFF = _env_float("KORTEX_SEARCH_RETRY_BACKOFF", 1.5)  # seconds, x2 per retry
